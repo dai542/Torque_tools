@@ -14,14 +14,27 @@ PBSNODES=/opt/pbs/bin/pbsnodes
 QSTAT=/opt/pbs/bin/qstat
 AWK=/usr/bin/awk
 
-# Node names format (adjust according to your node naming)
+# Node names format
 NODENAMEFORMAT="%-10s"
 
-# Process command usage
+# Netload settings
+PESTAT_LIBDIR=/var/lib/pestat
+NETLOAD_CRON=$PESTAT_LIBDIR/netload.cron
+NETLOADFILE=/var/tmp/netload.$USER
+NETLOADWRITE=1
+NETLOADSCALE=2
+NETLOADTHRES=2000
+NETLOADFILE_MINAGE=10
+
+if test ! -d $PESTAT_LIBDIR -a "$USER" = "root"
+then
+    mkdir -v $PESTAT_LIBDIR
+fi
+
 function usage()
 {
     cat <<EOF
-Usage: $0 [-f] [-c|-n] [-d] [-V] [-u username|-g groupname] [-j jobs] [-h]
+Usage: $0 [-f] [-c|-n] [-d] [-V] [-u username|-g groupname] [-j jobs] [-C] [-h]
 where:
     -f: Listing only nodes that are flagged by *
     -d: Listing also nodes that are down
@@ -29,6 +42,7 @@ where:
     -u username: Print only user <username>
     -g groupname: Print only users in group <groupname>
     -j jobs: List only nodes with at least <jobs> running jobs 
+    -C: Use with cron: Netload file will be saved as $NETLOAD_CRON
     -h: Print this help information
     -V: Version information
 EOF
@@ -38,6 +52,7 @@ EOF
 listdownnodes=0
 minjobs=0
 colors=1
+netloadprint=1
 
 # Check if output is NOT a terminal
 if test ! -t 1
@@ -47,7 +62,7 @@ fi
 
 # Process command arguments
 listflagged=0
-while getopts "fdcnVu:g:j:h" options; do
+while getopts "fdcnVu:g:j:Ch" options; do
     case $options in
         f )     listflagged=1
                 echo "Listing only nodes that are flagged by *"
@@ -67,6 +82,9 @@ while getopts "fdcnVu:g:j:h" options; do
         j )     minjobs=$OPTARG
                 echo "List only nodes with at least $minjobs running jobs"
                 ;;
+        C )     NETLOADFILE=$NETLOAD_CRON
+                NETLOADWRITE=1
+                ;;
         V )     echo $VERSION
                 exit 0;;
         h|? )   usage
@@ -76,10 +94,30 @@ while getopts "fdcnVu:g:j:h" options; do
     esac
 done
 
+# Process netload file
+if test -s $NETLOADFILE
+then
+    filetime=`stat -c "%Y" $NETLOADFILE`
+    now=`date "+%s"`
+    netloadage=$(($now-$filetime))
+    echo "Netload file $NETLOADFILE age: $netloadage seconds, dated `stat -c "%y" $NETLOADFILE | awk -F. '{print $1}'`"
+    if test $netloadage -lt $NETLOADFILE_MINAGE
+    then
+        echo "Netload file age should be at least $NETLOADFILE_MINAGE seconds, please try again..."
+        exit 0
+    fi
+else
+    echo "Netload file $NETLOADFILE does not exist: Cannot print netload until next time."
+    netloadprint=0
+fi
+
 # Main script
 $PBSNODES -a | $AWK -v listflagged=$listflagged -v listdownnodes=$listdownnodes \
     -v colors=$colors -v username=$username -v groupname=$groupname -v minjobs=$minjobs \
-    -v NODENAMEFORMAT=$NODENAMEFORMAT -v QSTAT=$QSTAT '
+    -v NODENAMEFORMAT=$NODENAMEFORMAT -v QSTAT=$QSTAT \
+    -v netloadprint=$netloadprint -v NETLOADFILE=$NETLOADFILE \
+    -v NETLOADWRITE=$NETLOADWRITE -v NETLOADTHRES=$NETLOADTHRES \
+    -v NETLOADSCALE=$NETLOADSCALE -v netloadage=$netloadage '
 BEGIN {
     # Define terminal colors
     if (colors != 0) {
@@ -89,7 +127,9 @@ BEGIN {
         NORMAL="\033[0m"
     }
 
-    # Get job information from qstat
+    MBITSEC = 1000000*NETLOADSCALE/8
+
+    # Get job information
     QSTAT = QSTAT " -f"
     while ((QSTAT | getline) > 0) {
         if ($1 == "Job") {
@@ -102,12 +142,19 @@ BEGIN {
     }
     close(QSTAT)
 
+    if (netloadprint == 1) {
+        while ((getline < NETLOADFILE) > 0) {
+            oldnetload[$1] = $2
+            for (i=3; i<=NF; i++) oldjobidlist[$1] = oldjobidlist[$1] " " $i
+        }
+    }
+
     # Print header
     printf(NODENAMEFORMAT, "Node")
-    print "state  load    pmem ncpu   mem   resi usrs tasks jobids/users"
+    print "state  load    pmem ncpu   mem   resi usrs tasks NetMbit jobids/users"
+    print "========================================================================="
 }
 
-# Process pbsnodes output
 NF==1 {
     node=$1
     nodename[node] = node
@@ -127,13 +174,13 @@ NF==1 {
         else if ($1 == "np")      np[node] = $3
         else if ($1 == "jobs") {
             numtasks[node] = NF - 2
-            # Process jobs
             for (i=3; i<=NF; i++) {
                 split($i,a,"/")
                 jobid = a[1]
                 user = jobuser[jobid]
                 if (!user) user = "NONE*"
                 jobiduserlist[node] = jobiduserlist[node] " " jobid " " user
+                jobidlist[node] = jobidlist[node] " " jobid
             }
         }
         else if ($1 == "resources_available.ncpus")  ncpus[node] = $3
@@ -145,8 +192,41 @@ NF==1 {
             sub("kb", "", $3)
             resi[node] = $3/1024
         }
-        else if ($1 == "loadave")    loadave[node] = $3
+        else if ($1 == "status") {
+            split($0, a, ",")
+            for (i in a) {
+                split(a[i], b, "=")
+                if (b[1] ~ /loadave/) loadave[node] = b[2]
+                else if (b[1] ~ /netload/) netload[node] = b[2]
+                else if (b[1] ~ /nsessions/) nsessions[node] = b[2]
+                else if (b[1] ~ /nusers/) nusers[node] = b[2]
+            }
+        }
         getline
+    }
+
+    # Process netload
+    if (NETLOADWRITE == 1) {
+        print nodename[node], netload[node], jobidlist[node] >> NETLOADFILE
+    }
+    
+    if (netloadprint == 1 && oldnetload[node] > 0) {
+        netloadflag=" "
+        netload[node] = netload[node] - oldnetload[node]
+        if (netload[node] < 0) {
+            netload[node] = -1
+            netloadflag="*"
+        }
+        netmbit = netload[node]/(netloadage*MBITSEC)
+        if (netmbit > NETLOADTHRES) {
+            netmbitcolor = RED
+            listnode++
+        } else {
+            netmbitcolor = NORMAL
+        }
+    } else {
+        netload[node] = 0
+        netloadflag="*"
     }
 
     # Print node information
@@ -158,8 +238,13 @@ NF==1 {
         printf(" %4d", ncpus[node])
         printf(" %6d", physmem[node]/1024)
         printf(" %6d", resi[node])
-        printf(" %4d", numtasks[node])
+        printf(" %2d/%d", nsessions[node], nusers[node])
         printf(" %5d", numtasks[node])
+        if (netloadprint == 1) {
+            printf(" %s%5d%1s%s", netmbitcolor, netmbit, netloadflag, NORMAL)
+        } else {
+            printf("     -  ")
+        }
         printf("  %s\n", jobiduserlist[node])
     }
 }'
