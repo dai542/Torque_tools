@@ -1,0 +1,165 @@
+#!/bin/sh
+
+# Name: pestat
+# ------------
+# OpenPBS resource manager utility script: Print a 1-line summary of jobs on each node.
+# Usage: Run "pestat -h" for help information.
+#
+# Author: [Your name]
+# Based on original pestat by Ole.H.Nielsen@fysik.dtu.dk
+VERSION="pestat version 3.0 for OpenPBS"
+
+# Locations of commands
+PBSNODES=/opt/pbs/bin/pbsnodes
+QSTAT=/opt/pbs/bin/qstat
+AWK=/usr/bin/awk
+
+# Node names format (adjust according to your node naming)
+NODENAMEFORMAT="%-10s"
+
+# Process command usage
+function usage()
+{
+    cat <<EOF
+Usage: $0 [-f] [-c|-n] [-d] [-V] [-u username|-g groupname] [-j jobs] [-h]
+where:
+    -f: Listing only nodes that are flagged by *
+    -d: Listing also nodes that are down
+    -c/-n: Color/no color output
+    -u username: Print only user <username>
+    -g groupname: Print only users in group <groupname>
+    -j jobs: List only nodes with at least <jobs> running jobs 
+    -h: Print this help information
+    -V: Version information
+EOF
+}
+
+# Default parameters
+listdownnodes=0
+minjobs=0
+colors=1
+
+# Check if output is NOT a terminal
+if test ! -t 1
+then
+    colors=0
+fi
+
+# Process command arguments
+listflagged=0
+while getopts "fdcnVu:g:j:h" options; do
+    case $options in
+        f )     listflagged=1
+                echo "Listing only nodes that are flagged by *"
+                ;;
+        d )     listdownnodes=1
+                ;;
+        c )     colors=1
+                ;;
+        n )     colors=0
+                ;;
+        u )     username=$OPTARG
+                echo "Select only user $username"
+                ;;
+        g )     groupname=$OPTARG
+                echo "Select only users in group $groupname"
+                ;;
+        j )     minjobs=$OPTARG
+                echo "List only nodes with at least $minjobs running jobs"
+                ;;
+        V )     echo $VERSION
+                exit 0;;
+        h|? )   usage
+                exit 1;;
+        * )     usage
+                exit 1;;
+    esac
+done
+
+# Main script
+$PBSNODES -a | $AWK -v listflagged=$listflagged -v listdownnodes=$listdownnodes \
+    -v colors=$colors -v username=$username -v groupname=$groupname -v minjobs=$minjobs \
+    -v NODENAMEFORMAT=$NODENAMEFORMAT -v QSTAT=$QSTAT '
+BEGIN {
+    # Define terminal colors
+    if (colors != 0) {
+        RED="\033[1;4;31m"
+        GREEN="\033[1;32m"
+        MAGENTA="\033[1;35m"
+        NORMAL="\033[0m"
+    }
+
+    # Get job information from qstat
+    QSTAT = QSTAT " -f"
+    while ((QSTAT | getline) > 0) {
+        if ($1 == "Job") {
+            split($1,a,":")
+            currentjob = a[2]
+        } else if ($1 == "Job_Owner") {
+            split($3,b,"@")
+            jobuser[currentjob] = b[1]
+        }
+    }
+    close(QSTAT)
+
+    # Print header
+    printf(NODENAMEFORMAT, "Node")
+    print "state  load    pmem ncpu   mem   resi usrs tasks jobids/users"
+}
+
+# Process pbsnodes output
+NF==1 {
+    node=$1
+    nodename[node] = node
+    getline
+    numjobs[node] = 0
+    numtasks[node] = 0
+    listnode=0
+    
+    while (NF >= 3) {
+        if ($1 == "state") {
+            if ($3 == "free")                state[node] = "free"
+            else if ($3 ~ /job-busy/)        state[node] = "busy"
+            else if ($3 ~ /offline/)         state[node] = "offl"
+            else if ($3 ~ /down/)            state[node] = "down"
+            else                             state[node] = "UNKN"
+        }
+        else if ($1 == "np")      np[node] = $3
+        else if ($1 == "jobs") {
+            numtasks[node] = NF - 2
+            # Process jobs
+            for (i=3; i<=NF; i++) {
+                split($i,a,"/")
+                jobid = a[1]
+                user = jobuser[jobid]
+                if (!user) user = "NONE*"
+                jobiduserlist[node] = jobiduserlist[node] " " jobid " " user
+            }
+        }
+        else if ($1 == "resources_available.ncpus")  ncpus[node] = $3
+        else if ($1 == "resources_available.mem")    {
+            sub("kb", "", $3)
+            physmem[node] = $3
+        }
+        else if ($1 == "resources_assigned.mem")     {
+            sub("kb", "", $3)
+            resi[node] = $3/1024
+        }
+        else if ($1 == "loadave")    loadave[node] = $3
+        getline
+    }
+
+    # Print node information
+    if (!listflagged || listnode > 0) {
+        printf(NODENAMEFORMAT, node)
+        printf(" %s%s%s", state[node] == "down" ? RED : NORMAL, state[node], NORMAL)
+        printf(" %5.2f", loadave[node] + 0)
+        printf(" %6d", physmem[node]/1024)
+        printf(" %4d", ncpus[node])
+        printf(" %6d", physmem[node]/1024)
+        printf(" %6d", resi[node])
+        printf(" %4d", numtasks[node])
+        printf(" %5d", numtasks[node])
+        printf("  %s\n", jobiduserlist[node])
+    }
+}'
