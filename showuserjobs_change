@@ -1,0 +1,126 @@
+#!/bin/bash
+
+# Script to show PBS job statistics
+# Author: [Your name]
+# Usage: ./show_pbs_jobs [-u username | -g groupname] [-h]
+
+# Function to display usage information
+function usage() {
+    cat <<EOF
+Usage: $0 [-u username | -g groupname] [-h]
+Options:
+    -u username: Show jobs for specific user
+    -g groupname: Show jobs for specific group
+    -h: Show this help message
+EOF
+}
+
+# Process command line arguments
+while getopts "u:g:h" options; do
+    case $options in
+        u) 
+            username=$OPTARG
+            echo "Filtering jobs for user: $username"
+            ;;
+        g) 
+            groupname=$OPTARG
+            echo "Filtering jobs for group: $groupname"
+            ;;
+        h) 
+            usage
+            exit 0 
+            ;;
+        ?) 
+            usage
+            exit 1 
+            ;;
+    esac
+done
+
+# Check if both username and groupname are specified
+if [ -n "$username" ] && [ -n "$groupname" ]; then
+    echo "Error: Cannot specify both username and groupname"
+    usage
+    exit 1
+fi
+
+# Print header with current timestamp
+echo "PBS Job Statistics - $(date)"
+printf "%-15s %-12s %-12s %-12s %-10s %-15s\n" \
+    "Username" "Running Jobs" "Queued Jobs" "Total Cores" "Queue" "Walltime"
+echo "========================================================================"
+
+# Main function to process and display job statistics
+process_jobs() {
+    local filter_cmd="cat"
+    if [ -n "$username" ]; then
+        filter_cmd="grep $username"
+    elif [ -n "$groupname" ]; then
+        # Note: Group filtering requires additional processing
+        filter_cmd="grep $groupname"
+    fi
+
+    qstat -f | $filter_cmd | awk '
+    BEGIN {
+        running = 0
+        queued = 0
+        total_cores = 0
+    }
+    
+    /Job_Owner/ {
+        split($3, owner, "@")
+        current_user = owner[1]
+        users[current_user] = 1
+    }
+    
+    /job_state/ {
+        state = $3
+        if (state == "R") {
+            running_jobs[current_user]++
+            total_running++
+        } else if (state == "Q") {
+            queued_jobs[current_user]++
+            total_queued++
+        }
+    }
+    
+    /Resource_List.ncpus/ {
+        cores = $3
+        total_cores += cores
+        user_cores[current_user] += cores
+    }
+    
+    /Resource_List.walltime/ {
+        walltime[current_user] = $3
+    }
+    
+    END {
+        # Print statistics for each user
+        for (user in users) {
+            printf "%-15s %-12d %-12d %-12d %-10s %-15s\n",
+                user,
+                running_jobs[user]+0,
+                queued_jobs[user]+0,
+                user_cores[user]+0,
+                "batch",
+                walltime[user]
+        }
+        
+        # Print total statistics
+        printf "%-15s %-12d %-12d %-12d %-10s %-15s\n",
+            "TOTAL",
+            total_running,
+            total_queued,
+            total_cores,
+            "ALL",
+            "-"
+    }'
+}
+
+# Execute the main function
+process_jobs
+
+# Print footer
+echo "------------------------------------------------------------------------"
+echo "Report generated on $(date)"
+echo "For detailed job information, use: qstat -f"
